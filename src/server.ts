@@ -12,7 +12,7 @@ import { Csrf } from "./csrf.ts";
 import { Store } from "./db.ts";
 import { Gateway } from "./gateway.ts";
 import type { GoogleEndpoints } from "./google/account.ts";
-import { AdminSessions, createApp } from "./http.ts";
+import { AdminSessions, approvalsKeyFromFile, createApp } from "./http.ts";
 import { type Layout, ensureLayout } from "./layout.ts";
 import { type Logger, consoleLogger, errorMessage } from "./log.ts";
 import { createMcpEndpoint } from "./mcp.ts";
@@ -139,6 +139,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
     // The port the pages answer on, for the local-mode host check.
     port: settings.port,
     sessions: mode === "local" ? AdminSessions.fromFile(layout.adminKey, store) : undefined,
+    approvalsKey: mode === "local" ? approvalsKeyFromFile(layout.approvalsKey) : undefined,
     closing: () => closing,
     log,
     allowLoopbackUpstreams: options.allowLoopbackUpstreams,

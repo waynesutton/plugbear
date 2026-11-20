@@ -24,6 +24,9 @@ export type Layout = {
   csrfKey: string;
   // Local mode: the key behind the admin pages' sign-in cookie.
   adminKey: string;
+  // Local mode: the bearer key for /api/approvals, which Threadbear's runner
+  // reads so it can show approvals in the thread that made the call.
+  approvalsKey: string;
   state: string;
   db: string;
   // Files agents upload for email attachments (see uploads.ts).
@@ -64,6 +67,7 @@ export function makeLayout(
     ntfyTopic: join(secrets, "ntfy-topic"),
     csrfKey: join(secrets, "csrf-key"),
     adminKey: join(secrets, "admin-key"),
+    approvalsKey: join(secrets, "approvals-key"),
     state,
     db: join(state, "connectors.sqlite"),
     uploadsDir: join(state, "uploads"),

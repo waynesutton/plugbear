@@ -25,7 +25,7 @@ import { upstreamsFor } from "./access.ts";
 import { type Approvals, MAX_GROUP_SIZE } from "./approvals.ts";
 import type { Config } from "./config.ts";
 import type { Csrf } from "./csrf.ts";
-import type { Store } from "./db.ts";
+import type { ApprovalRecord, Store } from "./db.ts";
 import type { Gateway } from "./gateway.ts";
 import { type Logger, errorMessage, silentLogger } from "./log.ts";
 import { callerAuthInfo } from "./mcp.ts";
@@ -76,6 +76,9 @@ export type AppDeps = {
   debugMcp?: boolean;
   // Where POST /uploads keeps files. Without it there's no /uploads.
   uploadsDir?: string;
+  // Local mode: the bearer key for /api/approvals. Without it there's no
+  // /api/approvals.
+  approvalsKey?: string;
   now?: () => number;
 };
 
@@ -133,6 +136,26 @@ export class AdminSessions {
 export function safeNext(next: string | undefined): string {
   if (!next || !/^\/(?:admin|approvals)(?:[/?]|$)/.test(next) || next.includes("\\")) return "/admin";
   return next;
+}
+
+/**
+ * The key for /api/approvals, made the first time: 32 random bytes as hex,
+ * in a 0600 file. Deleting the file ends every client's access at the next
+ * restart.
+ */
+export function approvalsKeyFromFile(path: string): string {
+  let hex = readSecretFile(path)?.trim();
+  if (!hex || !/^[0-9a-f]{64,}$/.test(hex)) {
+    hex = randomBytes(32).toString("hex");
+    writeSecretFile(path, `${hex}\n`);
+  }
+  return hex;
+}
+
+function sameKey(given: string, expected: string): boolean {
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function loopbackAddress(address: string | undefined): boolean {
@@ -220,7 +243,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
     });
 
   app.get("/health", (c) =>
-    c.json({ ok: true, version: VERSION, release: RELEASE, upstreams: deps.manager.statuses() }),
+    c.json({
+      ok: true,
+      version: VERSION,
+      release: RELEASE,
+      upstreams: deps.manager.statuses(),
+      ...(deps.approvalsKey ? { approvalsApi: 1 } : {}),
+    }),
   );
 
   const restarting = () =>
@@ -395,6 +424,80 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.use("/admin/*", adminOnly);
   app.use("/approvals/*", adminOnly);
   app.use("/oauth/*", adminOnly);
+
+  // /api/approvals: the same approvals as /approvals/<id>, for a program on
+  // this Mac (Threadbear's runner) rather than a browser. Local mode only,
+  // with the bearer key in secrets/approvals-key. A request with Origin or
+  // Sec-Fetch-Site (which browsers always send) is refused, so a web page
+  // can't use it even if it learned the key; the host and loopback checks
+  // stop DNS rebinding. Not Sec-Fetch-Mode: Node's own fetch sends that.
+  if (deps.mode === "local" && deps.approvalsKey) {
+    const key = deps.approvalsKey;
+    app.use("/api/approvals", apiOnly);
+    app.use("/api/approvals/*", apiOnly);
+    async function apiOnly(c: Context<Env>, next: () => Promise<void>) {
+      const refused = localCheck(c);
+      if (refused) return refused;
+      if (c.req.header("origin") || c.req.header("sec-fetch-site")) {
+        return c.json({ error: "browser_refused" }, 403);
+      }
+      const match = /^Bearer\s+(\S+)\s*$/i.exec(c.req.header("authorization") ?? "");
+      if (!match || !sameKey(match[1]!, key)) return c.json({ error: "unauthorized" }, 401);
+      await next();
+    }
+    const view = (record: ApprovalRecord) => {
+      let args: unknown = {};
+      try {
+        args = JSON.parse(record.argsJson);
+      } catch {
+        args = { truncated: record.argsJson };
+      }
+      return {
+        id: record.id,
+        status: record.status,
+        agent: record.agent,
+        upstream: record.upstream,
+        tool: record.tool,
+        upstreamTool: record.upstreamTool,
+        args,
+        createdAt: record.createdAt,
+        expiresAt: record.expiresAt,
+        decidedAt: record.decidedAt,
+        url: new URL(`/approvals/${encodeURIComponent(record.id)}`, deps.publicUrl).toString(),
+      };
+    };
+    app.get("/api/approvals", (c) =>
+      c.json({ approvals: deps.approvals.pending().map(view) }, 200, { "cache-control": "no-store" }),
+    );
+    app.get("/api/approvals/:id", (c) => {
+      const record = deps.approvals.get(c.req.param("id"));
+      if (!record) return c.json({ error: "not_found" }, 404);
+      return c.json(view(record), 200, { "cache-control": "no-store" });
+    });
+    app.post("/api/approvals/:id", async (c) => {
+      let body: { decision?: unknown; note?: unknown };
+      try {
+        body = (await c.req.json()) as typeof body;
+      } catch {
+        return c.json({ error: "bad_request" }, 400);
+      }
+      if (body.decision !== "approve" && body.decision !== "decline") return c.json({ error: "bad_request" }, 400);
+      const note = typeof body.note === "string" ? body.note : null;
+      const result = deps.approvals.decide(
+        c.req.param("id"),
+        body.decision === "approve" ? "approved" : "declined",
+        note,
+      );
+      if (!result.ok) {
+        return c.json(
+          { error: result.reason, ...(result.record ? { approval: view(result.record) } : {}) },
+          result.reason === "not_found" ? 404 : 409,
+        );
+      }
+      log.info(`approval ${result.record.id} ${result.record.status} through /api/approvals`);
+      return c.json(view(result.record));
+    });
+  }
 
   if (deps.mode === "local") {
     app.get("/admin/login", (c) => {
