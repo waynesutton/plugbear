@@ -101,6 +101,36 @@ describe("approvals API (local mode)", () => {
     assert.ok(!listed.approvals.some((a) => a.id === yes || a.id === no));
   });
 
+  it("approves and sends at once with run, after the hold ended, and only once", async () => {
+    const id = await hold("send me late");
+    const sent = await api(`/api/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "approve", run: true }) });
+    assert.equal(sent.status, 200);
+    const body = (await sent.json()) as { status: string; run: { ok: boolean; text: string } };
+    assert.equal(body.status, "ran");
+    assert.equal(body.run.ok, true);
+    assert.ok(body.run.text.length > 0, "the result's text");
+    const runs = gateway.store.calls({ agent: "codex", limit: 50 }).filter((call) => call.approvalId === id && call.decision === "approved");
+    assert.equal(runs.length, 1, "sent once");
+    // The agent that asked gets the same result if it checks later.
+    const client = await legacyClient(gateway, "codex");
+    const later = await client.callTool({ name: "connectors__await_approval", arguments: { id } });
+    await client.close();
+    assert.equal(textOf(later), body.run.text);
+    assert.equal(gateway.store.calls({ agent: "codex", limit: 50 }).filter((call) => call.approvalId === id && call.decision === "approved").length, 1);
+  });
+
+  it("never runs a declined call, and run must be a boolean", async () => {
+    const id = await hold("decline with run");
+    const declined = await api(`/api/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "decline", run: true }) });
+    assert.equal(declined.status, 200);
+    assert.equal(((await declined.json()) as { status: string; run?: unknown }).run, undefined);
+    assert.equal(gateway.approvals.get(id)?.status, "declined");
+    assert.equal(gateway.store.calls({ agent: "codex", limit: 50 }).filter((call) => call.approvalId === id && call.decision === "approved").length, 0);
+    const other = await hold("bad run");
+    assert.equal((await api(`/api/approvals/${other}`, { method: "POST", body: JSON.stringify({ decision: "approve", run: "yes" }) })).status, 400);
+    assert.equal(gateway.approvals.get(other)?.status, "pending");
+  });
+
   it("answers 404 and 400 for an unknown id or a bad body", async () => {
     assert.equal((await api("/api/approvals/ap_nope")).status, 404);
     assert.equal((await api("/api/approvals/ap_nope", { method: "POST", body: JSON.stringify({ decision: "approve" }) })).status, 404);

@@ -152,6 +152,30 @@ export function approvalsKeyFromFile(path: string): string {
   return hex;
 }
 
+// What a run gave, for /api/approvals: whether it worked and the text of
+// the result, cut short. Never the call's arguments.
+function runView(
+  outcome: Awaited<ReturnType<Gateway["runApprovedNow"]>>,
+): { ok: boolean; text: string } {
+  switch (outcome.kind) {
+    case "result": {
+      const text = (outcome.result.content ?? [])
+        .map((part) => (part && typeof part === "object" && (part as { type?: unknown }).type === "text" ? String((part as { text?: unknown }).text ?? "") : ""))
+        .join("\n")
+        .slice(0, 2000);
+      return { ok: outcome.result.isError !== true, text };
+    }
+    case "already_ran":
+      return { ok: true, text: "It had already run." };
+    case "expired":
+      return { ok: false, text: "It expired before it could run." };
+    case "unavailable":
+      return { ok: false, text: outcome.message };
+    case "not_approved":
+      return { ok: false, text: `It wasn't approved (${outcome.status ?? "gone"}).` };
+  }
+}
+
 function sameKey(given: string, expected: string): boolean {
   const a = Buffer.from(given);
   const b = Buffer.from(expected);
@@ -475,13 +499,14 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return c.json(view(record), 200, { "cache-control": "no-store" });
     });
     app.post("/api/approvals/:id", async (c) => {
-      let body: { decision?: unknown; note?: unknown };
+      let body: { decision?: unknown; note?: unknown; run?: unknown };
       try {
         body = (await c.req.json()) as typeof body;
       } catch {
         return c.json({ error: "bad_request" }, 400);
       }
       if (body.decision !== "approve" && body.decision !== "decline") return c.json({ error: "bad_request" }, 400);
+      if (body.run !== undefined && typeof body.run !== "boolean") return c.json({ error: "bad_request" }, 400);
       const note = typeof body.note === "string" ? body.note : null;
       const result = deps.approvals.decide(
         c.req.param("id"),
@@ -495,6 +520,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
         );
       }
       log.info(`approval ${result.record.id} ${result.record.status} through /api/approvals`);
+      // run: send it now, whether or not an agent is still waiting on it
+      // (an approval after the hold ended would otherwise wait for one).
+      if (body.decision === "approve" && body.run === true) {
+        const outcome = await deps.gateway.runApprovedNow(result.record.id);
+        const after = deps.approvals.get(result.record.id) ?? result.record;
+        return c.json({ ...view(after), run: runView(outcome) });
+      }
       return c.json(view(result.record));
     });
   }

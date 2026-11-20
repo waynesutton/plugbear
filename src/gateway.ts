@@ -9,6 +9,7 @@ import {
   ApprovalTooLargeError,
   MAX_PENDING_PER_AGENT,
   type Approvals,
+  type RunOutcome,
   type ToolResult,
   expiredAfterApproval,
 } from "./approvals.ts";
@@ -413,6 +414,29 @@ export class Gateway {
     });
     const current = await this.deps.approvals.wait(approval.id, this.deps.holdMs, ctx.signal);
     return this.settle(ctx, current ?? approval);
+  }
+
+  /**
+   * Runs an approved call now, for the owner (Threadbear's card through
+   * /api/approvals), as the agent that made it: once, through the same
+   * runApproved as connectors__await_approval, so a held call waking at
+   * the same moment shares its run rather than sending it twice. An agent
+   * that awaits it later gets the result.
+   */
+  async runApprovedNow(
+    id: string,
+  ): Promise<RunOutcome | { kind: "not_approved"; status?: string } | { kind: "unavailable"; message: string }> {
+    const record = this.deps.approvals.get(id);
+    if (!record || (record.status !== "approved" && record.status !== "ran")) return { kind: "not_approved", status: record?.status };
+    const agent = this.agent(record.agent);
+    const connection = this.deps.manager.get(record.upstream);
+    if (!agent || !connection || !agentCanUse(agent, connection.config)) {
+      return { kind: "unavailable", message: `${record.upstream} isn't available to ${record.agent} any more, so the call didn't run.` };
+    }
+    const ctx: CallContext = { agent, tailscaleLogin: record.tailscaleLogin };
+    return this.deps.approvals.runApproved(record, (args) =>
+      this.run(ctx, connection, record.tool, record.upstreamTool, args, "approved", record.id),
+    );
   }
 
   private async awaitApproval(ctx: CallContext, args: Record<string, unknown>): Promise<ToolResult> {
